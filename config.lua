@@ -15,6 +15,13 @@ FiveWatch.Config = {
   -- Milliseconds to wait for a response before treating it as unreachable.
   requestTimeoutMs = 3000,
 
+  -- Milliseconds to reuse the last connect-check result for the same
+  -- identifier instead of firing a new request — a player scripting rapid
+  -- connect/disconnect cycles would otherwise fire one outbound request per
+  -- attempt, unbounded, fast enough to burn through this server's shared
+  -- FiveWatch rate limit and deny real players' checks during the burst.
+  checkDebounceMs = 5000,
+
   -- What happens on a `flagged` result, per report category — checked
   -- against every *approved* report on the connecting player, worst wins
   -- (reject > quarantine > alert > log) if they've got more than one.

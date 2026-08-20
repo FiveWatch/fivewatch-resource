@@ -13,6 +13,14 @@ local function debugPrint(msg)
   end
 end
 
+-- nil on anything that isn't a decodable JSON object, so callers can just
+-- check truthiness instead of juggling pcall's ok/err pair themselves.
+local function decodeBody(responseText)
+  local ok, body = pcall(json.decode, responseText)
+  if ok and type(body) == 'table' then return body end
+  return nil
+end
+
 CreateThread(function()
   if not hasOxMysql then return end
   exports.oxmysql:execute([[
@@ -72,18 +80,97 @@ end
 -- README for why this can't just happen inline in playerConnecting).
 local pendingQuarantine = {}
 
-local function handleCheckResult(deferrals, src, playerName, license2, resolvedFlag, timedOutFlag, statusCode, responseText)
+-- Debounces repeated connect-check requests for the same identifier —
+-- without this, a player scripting rapid connect/disconnect cycles fires
+-- one outbound HTTP request per attempt with no limit, which can burn
+-- through this server's shared FiveWatch rate limit fast enough to deny
+-- real players' checks during the burst. Reuses the actual last response,
+-- not a blanket fail-open, so a just-rejected player can't bypass the
+-- reject by reconnecting inside the window.
+--
+-- Known limitation: the cache is only populated once a response actually
+-- lands, not when the request is first fired, so reconnect attempts faster
+-- than the round trip to the FiveWatch API (rare, but possible) still each
+-- fire their own request rather than being deduped. Closing that fully
+-- would mean queuing later connections to await the in-flight request's
+-- result instead of just letting them through — a bigger change than this
+-- debounce is worth for how narrow that window actually is in practice.
+local recentChecks = {}
+
+-- os.time() (whole seconds since epoch), not GetGameTimer() — GetGameTimer
+-- is a 32-bit millisecond counter that wraps roughly every 24.8 days, and
+-- resource restarts are common enough on updates/maintenance that a server
+-- can genuinely stay up past that. A wrapped timer makes `now - entry.ts`
+-- go negative, which silently defeats both the prune (`> debounceMs` never
+-- fires) and the freshness check (`< debounceMs` stays true) — every
+-- previously-cached license2 would then serve an arbitrarily stale result
+-- (e.g. a since-banned player let in on an old "clear") for the next cycle.
+-- Second granularity is fine here; the debounce window is a few seconds.
+
+local function cachedCheckResult(license2)
+  local now = os.time()
+  local debounceSec = math.ceil(FiveWatch.Config.checkDebounceMs / 1000)
+  -- Opportunistic prune on every lookup — keeps this bounded by recent
+  -- connection activity rather than every license2 ever seen, with no
+  -- separate cleanup thread needed.
+  for id, entry in pairs(recentChecks) do
+    if now - entry.ts > debounceSec then recentChecks[id] = nil end
+  end
+  local entry = recentChecks[license2]
+  if entry and now - entry.ts < debounceSec then return entry end
+  return nil
+end
+
+local function cacheCheckResult(license2, statusCode, responseText)
+  recentChecks[license2] = { statusCode = statusCode, responseText = responseText, ts = os.time() }
+end
+
+-- Printed once, not per-connection — a free-tier key gets a 403 on every
+-- single check, and with failOpen (the default) that's otherwise silent:
+-- every player gets waved through with no indication connect-checks are
+-- doing nothing at all, unless an operator happens to have debug on.
+local warnedPaidRequired = false
+
+-- fromCache: true when this call is replaying a debounced result rather
+-- than a fresh network response (see cachedCheckResult). Per-connection
+-- effects (deferrals, pendingQuarantine) still have to run every time —
+-- *this* connection needs its own resolution regardless of where the
+-- result came from — but logEvent/notifyStaff are about the underlying
+-- check itself, not this specific connection attempt, and firing them
+-- again for every debounced reconnect would just be a relocated version of
+-- the same spam the debounce cache exists to prevent (one DB row / chat
+-- ping per actual check, not per connection attempt).
+local function handleCheckResult(deferrals, src, playerName, license2, resolvedFlag, timedOutFlag, statusCode, responseText, fromCache)
   if resolvedFlag.value or timedOutFlag.value then return end
   resolvedFlag.value = true
 
   if statusCode ~= 200 then
+    if statusCode == 403 then
+      -- Checked via the response body's machine-readable `code`, not the
+      -- bare status code or the human-readable `error` text — a future
+      -- unrelated 403 (bad key, WAF, etc.) shouldn't be misreported as a
+      -- billing problem, and rewording the API's error message can't
+      -- silently break this.
+      local body = decodeBody(responseText)
+      if body and body.code == 'paid_tier_required' then
+        if not warnedPaidRequired then
+          warnedPaidRequired = true
+          print('[fivewatch] Connect-checks are disabled: this API key needs a paid FiveWatch account. Players are joining unchecked. See fivewatch.net/servers.')
+        end
+        -- Always fail open here, regardless of the failOpen setting — this
+        -- is a billing gap on this server, not a service outage, and
+        -- shouldn't be able to lock every connecting player out.
+        deferrals.done()
+        return
+      end
+    end
     debugPrint(('check failed with status %s'):format(tostring(statusCode)))
     if FiveWatch.Config.failOpen then deferrals.done() else deferrals.done('FiveWatch check unavailable, try again shortly.') end
     return
   end
 
-  local ok, body = pcall(json.decode, responseText)
-  if not ok or not body or not body.status then
+  local body = decodeBody(responseText)
+  if not body or not body.status then
     debugPrint('check returned an unreadable response')
     if FiveWatch.Config.failOpen then deferrals.done() else deferrals.done('FiveWatch check unavailable, try again shortly.') end
     return
@@ -95,7 +182,7 @@ local function handleCheckResult(deferrals, src, playerName, license2, resolvedF
   end
 
   local action, category = resolveAction(body)
-  logEvent(license2, playerName, body.status, category, action)
+  if not fromCache then logEvent(license2, playerName, body.status, category, action) end
   TriggerEvent('fivewatch:playerFlagged', src, body.status, category, action)
 
   if action == 'reject' then
@@ -108,7 +195,9 @@ local function handleCheckResult(deferrals, src, playerName, license2, resolvedF
   if action == 'quarantine' then
     pendingQuarantine[src] = { status = body.status, category = category }
   elseif action == 'alert' then
-    notifyStaff(('%s connecting with status: %s (%s)'):format(playerName, body.status, category or 'contested'))
+    if not fromCache then
+      notifyStaff(('%s connecting with status: %s (%s)'):format(playerName, body.status, category or 'contested'))
+    end
   else
     debugPrint(('%s connecting with status: %s'):format(playerName, body.status))
   end
@@ -124,6 +213,12 @@ AddEventHandler('playerConnecting', function(name, setKickReason, deferrals)
   if not license2 then
     debugPrint(('no license2 for connecting player %s, allowing join'):format(name))
     deferrals.done()
+    return
+  end
+
+  local cached = cachedCheckResult(license2)
+  if cached then
+    handleCheckResult(deferrals, src, name, license2, { value = false }, { value = false }, cached.statusCode, cached.responseText, true)
     return
   end
 
@@ -144,6 +239,18 @@ AddEventHandler('playerConnecting', function(name, setKickReason, deferrals)
   PerformHttpRequest(
     FiveWatch.Config.apiUrl .. '/v1/check',
     function(statusCode, responseText)
+      -- Only a genuine 200 verdict (clear or flagged) is worth reusing for
+      -- a reconnecting player. Caching a non-200 response (a transient 5xx,
+      -- a curl/DNS error reported as statusCode 0, a paid-tier 403) would
+      -- replay that failure for the rest of the debounce window instead of
+      -- giving the next reconnect attempt a fresh shot at the network —
+      -- with failOpen=true that's a flagged player getting waved through
+      -- purely because the last check happened to error, and with
+      -- failOpen=false it's a legitimate player stuck getting rejected
+      -- after the API has already recovered.
+      if statusCode == 200 then
+        cacheCheckResult(license2, statusCode, responseText)
+      end
       handleCheckResult(deferrals, src, name, license2, resolvedFlag, timedOutFlag, statusCode, responseText)
     end,
     'POST',
@@ -214,8 +321,8 @@ RegisterCommand('fivewatch-verify', function(src)
         notifyPlayer(src, 'Verification failed, try again shortly.')
         return
       end
-      local ok, body = pcall(json.decode, responseText)
-      if not ok or not body or not body.code then
+      local body = decodeBody(responseText)
+      if not body or not body.code then
         notifyPlayer(src, 'Verification failed, try again shortly.')
         return
       end
